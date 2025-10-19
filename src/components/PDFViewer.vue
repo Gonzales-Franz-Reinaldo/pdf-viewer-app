@@ -41,21 +41,24 @@
             </div>
 
             <!-- Contenido del PDF -->
-            <div ref="pdfContainer" class="flex-1 overflow-y-auto bg-gray-400 p-4">
-                <div v-if="loading" class="flex flex-col items-center justify-center h-full text-gray-600">
+            <div ref="pdfContainer" class="flex-1 overflow-y-auto bg-gray-400 p-4 relative">
+                <!-- Loading overlay -->
+                <div v-show="loading" class="absolute inset-0 flex flex-col items-center justify-center bg-gray-400 text-gray-600 z-10">
                     <div class="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mb-4"></div>
                     <p class="text-lg">Cargando PDF...</p>
                 </div>
 
-                <div v-else-if="!loading && renderedPages.length === 0"
+                <!-- Mensaje de "sin PDF" -->
+                <div v-show="!loading && renderedPages.length === 0"
                     class="flex flex-col items-center justify-center h-full text-gray-500">
                     <Upload :size="64" class="mb-4 opacity-50" />
                     <p class="text-lg">Carga un documento PDF para comenzar</p>
                     <p class="text-sm mt-2">Haz clic en "Cargar PDF" en la esquina superior derecha</p>
                 </div>
 
-                <div v-else class="flex flex-col items-center gap-4">
-                    <div v-for="pageNum in renderedPages" :key="pageNum" :id="`page-${pageNum}`"
+                <!-- Canvas con v-show -->
+                <div v-show="renderedPages.length > 0" class="flex flex-col items-center gap-4">
+                    <div v-for="pageNum in renderedPages" :key="`page-container-${pageNum}`" :id="`page-${pageNum}`"
                         :class="[
                             'relative bg-white shadow-2xl transition-all',
                             selectedComment === pageNum ? 'ring-4 ring-blue-400' : ''
@@ -66,10 +69,10 @@
                             Página {{ pageNum }} de {{ numPages }}
                         </div>
 
-                        <!-- Canvas para renderizar PDF -->
+                        <!-- Canvas con :ref dinámico (RÁPIDO) -->
                         <canvas :ref="el => setCanvasRef(pageNum, el)" class="block" />
 
-                        <!-- Capa de texto transparente para selección -->
+                        <!-- Capa de texto transparente -->
                         <div :id="`textLayer-${pageNum}`" class="absolute top-0 left-0 pdf-text-layer" />
                     </div>
                 </div>
@@ -89,17 +92,15 @@ import * as pdfjsLib from 'pdfjs-dist'
 import CommentsSidebar from './CommentsSidebar.vue'
 import CommentForm from './CommentForm.vue'
 
-// ✅ Configurar worker LOCAL
+// Configurar worker LOCAL
 pdfjsLib.GlobalWorkerOptions.workerSrc = '/pdf.worker.min.mjs'
 
 // Referencias
 const fileInput = ref(null)
 const pdfContainer = ref(null)
 const canvasRefs = ref({})
-const renderQueue = new Map()
-const isRendering = ref(false) // ✅ NUEVO: Flag para evitar renderizados concurrentes
 
-// ✅ Estado
+// Estado
 const pdfFile = ref(null)
 const pdfDoc = shallowRef(null)
 const numPages = ref(0)
@@ -117,16 +118,15 @@ const selectedComment = ref(null)
 const scale = ref(1.5)
 const loading = ref(false)
 
-let canvasObserver = null
+// Control de renderizado paralelo
+let zoomTimeout = null
+const renderingTasks = new Map()
+const PARALLEL_RENDER_LIMIT = 5 // Renderizar 5 páginas en paralelo
 
-// Métodos
+// Guardar referencia de canvas
 const setCanvasRef = (pageNum, el) => {
     if (el) {
         canvasRefs.value[pageNum] = el
-        if (pdfDoc.value && renderQueue.has(pageNum)) {
-            renderPage(pdfDoc.value, pageNum, el)
-            renderQueue.delete(pageNum)
-        }
     }
 }
 
@@ -135,18 +135,31 @@ const triggerFileInput = () => {
 }
 
 const zoomIn = () => {
-    scale.value = Math.min(3, scale.value + 0.2)
+    if (scale.value < 3) {
+        scale.value = Math.min(3, scale.value + 0.2)
+    }
 }
 
 const zoomOut = () => {
-    scale.value = Math.max(0.5, scale.value - 0.2)
+    if (scale.value > 0.5) {
+        scale.value = Math.max(0.5, scale.value - 0.2)
+    }
 }
 
-const renderPage = async (pdf, pageNum, canvas) => {
+// RENDERIZADO DE PÁGINA (sin capa de texto para velocidad)
+const renderPage = async (pdf, pageNum, canvas, includeTextLayer = true) => {
     if (!canvas) {
-        console.warn(`Canvas ${pageNum} not available yet`)
-        renderQueue.set(pageNum, true)
-        return
+        return false
+    }
+
+    // Cancelar renderizado anterior
+    if (renderingTasks.has(pageNum)) {
+        try {
+            await renderingTasks.get(pageNum).cancel()
+        } catch (e) {
+            // Ignorar
+        }
+        renderingTasks.delete(pageNum)
     }
 
     try {
@@ -154,8 +167,6 @@ const renderPage = async (pdf, pageNum, canvas) => {
         const viewport = page.getViewport({ scale: scale.value })
 
         const context = canvas.getContext('2d')
-        
-        // ✅ IMPORTANTE: Limpiar canvas antes de renderizar
         canvas.height = viewport.height
         canvas.width = viewport.width
         context.clearRect(0, 0, canvas.width, canvas.height)
@@ -165,112 +176,119 @@ const renderPage = async (pdf, pageNum, canvas) => {
             viewport: viewport
         }
 
-        await page.render(renderContext).promise
+        const renderTask = page.render(renderContext)
+        renderingTasks.set(pageNum, renderTask)
+        await renderTask.promise
+        renderingTasks.delete(pageNum)
 
-        // Crear capa de texto para selección
-        const textLayer = document.getElementById(`textLayer-${pageNum}`)
-        if (textLayer) {
-            textLayer.innerHTML = ''
-            textLayer.style.width = viewport.width + 'px'
-            textLayer.style.height = viewport.height + 'px'
+        // Crear capa de texto SOLO si se solicita (mejora velocidad)
+        if (includeTextLayer) {
+            const textLayer = document.getElementById(`textLayer-${pageNum}`)
+            if (textLayer) {
+                textLayer.innerHTML = ''
+                textLayer.style.width = viewport.width + 'px'
+                textLayer.style.height = viewport.height + 'px'
 
-            const textContent = await page.getTextContent()
-            const lines = {}
+                const textContent = await page.getTextContent()
+                const lines = {}
 
-            textContent.items.forEach((item) => {
-                const tx = pdfjsLib.Util.transform(viewport.transform, item.transform)
-                const style = textContent.styles[item.fontName]
+                textContent.items.forEach((item) => {
+                    const tx = pdfjsLib.Util.transform(viewport.transform, item.transform)
+                    const style = textContent.styles[item.fontName]
+                    const angle = Math.atan2(tx[1], tx[0])
+                    const fontHeight = Math.hypot(tx[2], tx[3])
+                    const fontAscent = style && style.ascent ? style.ascent : 0
+                    const top = Math.round(tx[5] - fontHeight * fontAscent)
 
-                const angle = Math.atan2(tx[1], tx[0])
-                const fontHeight = Math.hypot(tx[2], tx[3])
-                const fontAscent = style && style.ascent ? style.ascent : 0
-                const top = Math.round(tx[5] - fontHeight * fontAscent)
-
-                if (!lines[top]) {
-                    lines[top] = []
-                }
-
-                lines[top].push({
-                    str: item.str,
-                    left: tx[4],
-                    top: top,
-                    fontSize: fontHeight,
-                    fontFamily: item.fontName,
-                    width: item.width * viewport.scale,
-                    angle: angle
-                })
-            })
-
-            Object.keys(lines).sort((a, b) => a - b).forEach(lineTop => {
-                const lineDiv = document.createElement('div')
-                lineDiv.style.position = 'absolute'
-                lineDiv.style.left = '0'
-                lineDiv.style.top = lineTop + 'px'
-                lineDiv.style.height = (lines[lineTop][0].fontSize * 1.2) + 'px'
-                lineDiv.style.whiteSpace = 'nowrap'
-                lineDiv.style.userSelect = 'text'
-
-                lines[lineTop].sort((a, b) => a.left - b.left)
-
-                lines[lineTop].forEach(item => {
-                    const span = document.createElement('span')
-                    span.textContent = item.str
-                    span.style.position = 'absolute'
-                    span.style.left = item.left + 'px'
-                    span.style.fontSize = item.fontSize + 'px'
-                    span.style.fontFamily = item.fontFamily
-                    span.style.color = 'transparent'
-                    span.style.userSelect = 'text'
-                    span.style.pointerEvents = 'auto'
-
-                    if (item.angle !== 0) {
-                        span.style.transform = `rotate(${item.angle}rad)`
+                    if (!lines[top]) {
+                        lines[top] = []
                     }
 
-                    lineDiv.appendChild(span)
+                    lines[top].push({
+                        str: item.str,
+                        left: tx[4],
+                        top: top,
+                        fontSize: fontHeight,
+                        fontFamily: item.fontName,
+                        width: item.width * viewport.scale,
+                        angle: angle
+                    })
                 })
 
-                textLayer.appendChild(lineDiv)
-            })
-        }
+                Object.keys(lines).sort((a, b) => a - b).forEach(lineTop => {
+                    const lineDiv = document.createElement('div')
+                    lineDiv.style.position = 'absolute'
+                    lineDiv.style.left = '0'
+                    lineDiv.style.top = lineTop + 'px'
+                    lineDiv.style.height = (lines[lineTop][0].fontSize * 1.2) + 'px'
+                    lineDiv.style.whiteSpace = 'nowrap'
+                    lineDiv.style.userSelect = 'text'
 
-        console.log(`✅ Página ${pageNum} renderizada correctamente (escala: ${scale.value})`)
-    } catch (error) {
-        console.error(`Error rendering page ${pageNum}:`, error)
-    }
-}
+                    lines[lineTop].sort((a, b) => a.left - b.left)
 
-// ✅ NUEVO: Función para renderizar todas las páginas
-const renderAllPages = async () => {
-    if (!pdfDoc.value || renderedPages.value.length === 0 || isRendering.value) {
-        return
-    }
+                    lines[lineTop].forEach(item => {
+                        const span = document.createElement('span')
+                        span.textContent = item.str
+                        span.style.position = 'absolute'
+                        span.style.left = item.left + 'px'
+                        span.style.fontSize = item.fontSize + 'px'
+                        span.style.fontFamily = item.fontFamily
+                        span.style.color = 'transparent'
+                        span.style.userSelect = 'text'
+                        span.style.pointerEvents = 'auto'
 
-    isRendering.value = true
-    loading.value = true
+                        if (item.angle !== 0) {
+                            span.style.transform = `rotate(${item.angle}rad)`
+                        }
 
-    try {
-        console.log(`🔄 Re-renderizando ${renderedPages.value.length} páginas con escala ${scale.value}...`)
-        
-        await nextTick()
-        await nextTick()
+                        lineDiv.appendChild(span)
+                    })
 
-        for (const pageNum of renderedPages.value) {
-            const canvas = canvasRefs.value[pageNum]
-            if (canvas) {
-                await renderPage(pdfDoc.value, pageNum, canvas)
-            } else {
-                console.warn(`⚠️ Canvas ${pageNum} no disponible para re-renderizado`)
+                    textLayer.appendChild(lineDiv)
+                })
             }
         }
 
-        console.log('✅ Re-renderizado completado')
+        return true
     } catch (error) {
-        console.error('❌ Error en re-renderizado:', error)
-    } finally {
-        isRendering.value = false
-        loading.value = false
+        if (error.name === 'RenderingCancelledException') {
+            console.log(` Página ${pageNum} cancelada`)
+        } else {
+            console.error(` Error página ${pageNum}:`, error)
+        }
+        renderingTasks.delete(pageNum)
+        return false
     }
+}
+
+// RENDERIZADO PARALELO EN LOTES
+const renderAllPagesParallel = async (includeTextLayer = true) => {
+    if (!pdfDoc.value || renderedPages.value.length === 0) {
+        return
+    }
+
+    console.log(` Renderizado paralelo de ${renderedPages.value.length} páginas (${PARALLEL_RENDER_LIMIT} a la vez)`)
+
+    // Dividir en lotes de páginas
+    const batches = []
+    for (let i = 0; i < renderedPages.value.length; i += PARALLEL_RENDER_LIMIT) {
+        batches.push(renderedPages.value.slice(i, i + PARALLEL_RENDER_LIMIT))
+    }
+
+    // Renderizar cada lote en paralelo
+    for (const batch of batches) {
+        const promises = batch.map(pageNum => {
+            const canvas = canvasRefs.value[pageNum]
+            if (canvas) {
+                return renderPage(pdfDoc.value, pageNum, canvas, includeTextLayer)
+            }
+            return Promise.resolve(false)
+        })
+
+        await Promise.all(promises)
+    }
+
+    console.log( Renderizado completado')
 }
 
 const handleFileUpload = async (e) => {
@@ -279,11 +297,20 @@ const handleFileUpload = async (e) => {
         loading.value = true
         pdfFile.value = file
 
-        // ✅ Limpiar estado previo
+        // Limpiar estado
         renderedPages.value = []
         canvasRefs.value = {}
         numPages.value = 0
-        renderQueue.clear()
+        
+        // Cancelar renderizados
+        for (const [pageNum, task] of renderingTasks) {
+            try {
+                task.cancel()
+            } catch (e) {
+                // Ignorar
+            }
+        }
+        renderingTasks.clear()
 
         try {
             const arrayBuffer = await file.arrayBuffer()
@@ -295,43 +322,27 @@ const handleFileUpload = async (e) => {
             pdfDoc.value = pdf
             numPages.value = pdf.numPages
 
-            // ✅ Crear array de páginas
+            console.log(` PDF cargado: ${pdf.numPages} páginas`)
+
+            // Crear array de páginas
             const pages = Array.from({ length: pdf.numPages }, (_, i) => i + 1)
             renderedPages.value = pages
 
-            // ✅ Esperar múltiples ciclos de Vue
+            // CRÍTICO: Esperar mínimo tiempo
             await nextTick()
             await nextTick()
             
-            // ✅ Esperar un poco más para asegurar que el DOM esté completamente listo
-            await new Promise(resolve => setTimeout(resolve, 200))
-            
-            // ✅ Renderizar todas las páginas que tengan canvas disponible
-            for (let i = 1; i <= pdf.numPages; i++) {
-                const canvas = canvasRefs.value[i]
-                if (canvas) {
-                    await renderPage(pdf, i, canvas)
-                } else {
-                    renderQueue.set(i, true)
-                }
-            }
-            
-            // ✅ Intentar renderizar páginas pendientes después de otro delay
-            if (renderQueue.size > 0) {
-                await new Promise(resolve => setTimeout(resolve, 300))
-                
-                for (const [pageNum] of renderQueue) {
-                    const canvas = canvasRefs.value[pageNum]
-                    if (canvas) {
-                        await renderPage(pdf, pageNum, canvas)
-                        renderQueue.delete(pageNum)
-                    }
-                }
-            }
-            
+            // QUITAR LOADING INMEDIATAMENTE - Usuario ve estructura
             loading.value = false
+            
+            // Pequeña espera para que se monten canvas
+            await new Promise(resolve => setTimeout(resolve, 50))
+            
+            // RENDERIZADO PARALELO en segundo plano (no bloquea UI)
+            renderAllPagesParallel(true)
+            
         } catch (error) {
-            console.error('Error loading PDF:', error)
+            console.error(' Error cargando PDF:', error)
             loading.value = false
             alert('Error al cargar el PDF. Por favor, intenta con otro archivo.')
         }
@@ -389,35 +400,49 @@ const deleteComment = (id) => {
     comments.value = comments.value.filter(c => c.id !== id)
 }
 
-// ✅ MEJORADO: Observar cambios en el zoom con debounce optimizado
-let zoomTimeout = null
+// ZOOM CON RENDERIZADO PARALELO
 watch(scale, (newScale, oldScale) => {
     if (!pdfDoc.value || renderedPages.value.length === 0) return
     
-    console.log(`🔍 Zoom cambiado: ${oldScale.toFixed(2)} → ${newScale.toFixed(2)}`)
+    console.log(` Zoom: ${oldScale.toFixed(2)} → ${newScale.toFixed(2)}`)
     
-    // ✅ Cancelar timeout anterior
     if (zoomTimeout) {
         clearTimeout(zoomTimeout)
     }
     
-    // ✅ Esperar 400ms antes de re-renderizar (debounce)
-    zoomTimeout = setTimeout(() => {
-        renderAllPages()
-    }, 400)
+    // Cancelar renderizados
+    for (const [pageNum, task] of renderingTasks) {
+        try {
+            task.cancel()
+        } catch (e) {
+            // Ignorar
+        }
+    }
+    renderingTasks.clear()
+    
+    // Re-renderizar con debounce más corto
+    zoomTimeout = setTimeout(async () => {
+        loading.value = true
+        await renderAllPagesParallel(true)
+        loading.value = false
+    }, 200) // Reducido de 300ms a 200ms
 })
 
-// ✅ Limpiar al desmontar
 onBeforeUnmount(() => {
-    if (canvasObserver) {
-        canvasObserver.disconnect()
-    }
     if (zoomTimeout) {
         clearTimeout(zoomTimeout)
     }
+    
+    for (const [pageNum, task] of renderingTasks) {
+        try {
+            task.cancel()
+        } catch (e) {
+            // Ignorar
+        }
+    }
+    renderingTasks.clear()
 })
 </script>
-
 
 <style scoped>
 /* Estilos para la capa de texto del PDF */
