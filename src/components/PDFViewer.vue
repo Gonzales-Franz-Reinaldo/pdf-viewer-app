@@ -288,7 +288,7 @@ const renderAllPagesParallel = async (includeTextLayer = true) => {
         await Promise.all(promises)
     }
 
-    console.log( Renderizado completado')
+    console.log( 'Renderizado completado')
 }
 
 const handleFileUpload = async (e) => {
